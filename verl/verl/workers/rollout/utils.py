@@ -49,17 +49,48 @@ async def run_unvicorn(app: FastAPI, server_args, server_address, max_retries=5)
     server_port, server_task = None, None
 
     for i in range(max_retries):
+        sock = None
+        server = None
         try:
             server_port, sock = get_free_port(server_address)
             app.server_args = server_args
             config = uvicorn.Config(app, host=server_address, port=server_port, log_level="warning")
             server = uvicorn.Server(config)
-            server.should_exit = True
-            await server.serve()
-            server_task = asyncio.create_task(server.main_loop())
+            server_task = asyncio.create_task(server.serve(sockets=[sock]))
+
+            deadline = asyncio.get_running_loop().time() + 60
+            last_error = None
+            while asyncio.get_running_loop().time() < deadline:
+                if server_task.done():
+                    server_task.result()
+                    raise RuntimeError("uvicorn server exited before accepting connections")
+
+                try:
+                    reader, writer = await asyncio.open_connection(host=server_address, port=server_port)
+                    writer.close()
+                    await writer.wait_closed()
+                    break
+                except OSError as e:
+                    last_error = e
+                    await asyncio.sleep(0.1)
+            else:
+                raise RuntimeError(
+                    f"Timed out waiting for HTTP server on {server_address}:{server_port}"
+                ) from last_error
+
             break
-        except (OSError, SystemExit) as e:
+        except (OSError, SystemExit, RuntimeError) as e:
             logger.error(f"Failed to start HTTP server on port {server_port} at try {i}, error: {e}")
+            if server is not None:
+                server.should_exit = True
+            if server_task is not None and not server_task.done():
+                server_task.cancel()
+                try:
+                    await server_task
+                except asyncio.CancelledError:
+                    pass
+            if sock is not None:
+                sock.close()
     else:
         logger.error(f"Failed to start HTTP server after {max_retries} retries, exiting...")
         os._exit(-1)

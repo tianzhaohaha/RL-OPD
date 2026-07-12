@@ -187,6 +187,54 @@ trainer:
   # Number of iterations to warm up the critic before updating policy
   critic_warmup: 0
 
+  # Sparse projection config for actor parameter updates
+  sparse_projection:
+
+    # Whether to project actor parameter deltas into the previous anchor sparse space
+    enable: False
+
+    # Apply sparse projection every N training steps
+    interval: 50
+
+    # Cumulative eigenspace energy ratio used to select projection directions
+    energy_ratio: 0.5
+
+    # Soft projection strength
+    alpha: 0.5
+
+    # Skip tensors whose flattened column dimension exceeds this value; 0 disables the limit
+    max_projection_dim: 0
+
+    # Target transformer matrices to project. Valid values include all, attn, mlp, q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
+    target_matrices: all
+
+    # Whether to clear actor optimizer state after each projection
+    reset_optimizer_state: False
+
+  # HSE monitor config for actor weights during training
+  hse_monitor:
+
+    # Whether to compute actor weight Riesz HSE metrics during training
+    enable: False
+
+    # Compute HSE every N training steps
+    interval: 50
+
+    # Target transformer matrices to monitor. Valid values include all, attn, mlp, q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj, all_params
+    target_matrices: all
+
+    # Riesz exponent
+    s: 1.0
+
+    # Exact row chunk size for lower peak memory; 0 means full matrix
+    chunk_size: 0
+
+    # Numerical epsilon for row normalization and pairwise distances
+    eps: 1.0e-6
+
+    # Also compute HSE once at global step 0 after checkpoint loading
+    log_initial: True
+
   # Default path to distributed filesystem for saving checkpoints
   default_hdfs_dir: null
 

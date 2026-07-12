@@ -905,6 +905,85 @@ class RayPPOTrainer:
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
+    def _sparse_projection_config(self):
+        return self.config.trainer.get("sparse_projection", {})
+
+    def _hse_monitor_config(self):
+        return self.config.trainer.get("hse_monitor", {})
+
+    @staticmethod
+    def _as_bool(value):
+        if isinstance(value, str):
+            return value.lower() in {"1", "true", "yes", "y", "on"}
+        return bool(value)
+
+    def _sparse_projection_enabled(self):
+        return self._as_bool(self._sparse_projection_config().get("enable", False))
+
+    def _hse_monitor_enabled(self):
+        return self._as_bool(self._hse_monitor_config().get("enable", False))
+
+    @staticmethod
+    def _reduce_worker_metric_list(worker_metrics):
+        if not worker_metrics:
+            return {}
+
+        reduced_metrics = defaultdict(list)
+        for metrics in worker_metrics:
+            for key, value in metrics.items():
+                reduced_metrics[key].append(value)
+        return reduce_metrics(reduced_metrics)
+
+    def _init_sparse_projection_anchor(self):
+        if not self._sparse_projection_enabled():
+            return {}
+
+        sparse_projection_config = self._sparse_projection_config()
+        projection_metrics = self.actor_rollout_wg.init_sparse_projection_anchor(
+            target_matrices=sparse_projection_config.get("target_matrices", None),
+        )
+        return self._reduce_worker_metric_list(projection_metrics)
+
+    def _maybe_apply_sparse_projection(self):
+        if not self._sparse_projection_enabled():
+            return {}
+
+        sparse_projection_config = self._sparse_projection_config()
+        interval = int(sparse_projection_config.get("interval", 50))
+        if interval <= 0:
+            return {}
+        if self.global_steps % interval != 0:
+            return {}
+
+        projection_metrics = self.actor_rollout_wg.apply_sparse_projection(
+            energy_ratio=float(sparse_projection_config.get("energy_ratio", 0.5)),
+            alpha=float(sparse_projection_config.get("alpha", 0.5)),
+            max_projection_dim=int(sparse_projection_config.get("max_projection_dim", 0)),
+            reset_optimizer_state=self._as_bool(sparse_projection_config.get("reset_optimizer_state", False)),
+            target_matrices=sparse_projection_config.get("target_matrices", None),
+        )
+        return self._reduce_worker_metric_list(projection_metrics)
+
+    def _maybe_compute_hse_monitor(self, force=False):
+        if not self._hse_monitor_enabled():
+            return {}
+
+        hse_monitor_config = self._hse_monitor_config()
+        interval = int(hse_monitor_config.get("interval", 50))
+        if not force:
+            if interval <= 0:
+                return {}
+            if self.global_steps % interval != 0:
+                return {}
+
+        hse_metrics = self.actor_rollout_wg.compute_hse_monitor_metrics(
+            target_matrices=hse_monitor_config.get("target_matrices", "all"),
+            s=float(hse_monitor_config.get("s", 1.0)),
+            chunk_size=int(hse_monitor_config.get("chunk_size", 0)),
+            eps=float(hse_monitor_config.get("eps", 1e-6)),
+        )
+        return self._reduce_worker_metric_list(hse_metrics)
+
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
         if do_profile:
@@ -986,6 +1065,15 @@ class RayPPOTrainer:
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+
+        if self._sparse_projection_enabled():
+            sparse_projection_metrics = self._init_sparse_projection_anchor()
+            pprint(f"Sparse projection initialized: {sparse_projection_metrics}")
+
+        if self._hse_monitor_enabled() and self._as_bool(self._hse_monitor_config().get("log_initial", True)):
+            hse_monitor_metrics = self._maybe_compute_hse_monitor(force=True)
+            pprint(f"Initial HSE monitor metrics: {hse_monitor_metrics}")
+            logger.log(data=hse_monitor_metrics, step=self.global_steps)
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -2259,6 +2347,14 @@ class RayPPOTrainer:
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+
+                        with marked_timer("sparse_projection", timing_raw, color="blue"):
+                            sparse_projection_metrics = self._maybe_apply_sparse_projection()
+                        metrics.update(sparse_projection_metrics)
+
+                        with marked_timer("hse_monitor", timing_raw, color="blue"):
+                            hse_monitor_metrics = self._maybe_compute_hse_monitor()
+                        metrics.update(hse_monitor_metrics)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

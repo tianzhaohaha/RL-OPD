@@ -190,6 +190,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
         self._is_ref = self.role in ["ref", "actor_rollout_ref"]
         self.use_orig_params = self.config.actor.fsdp_config.get("use_orig_params", False)
+        self._sparse_projection_anchor = None
 
         # TODO(haibin.lin):
         # As of now the type of config is DictConfig, if we assign config.profiler with ProfilerConfig,
@@ -861,6 +862,474 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
                 checkpoint_config=checkpoint_contents,
             )
+
+    def _check_sparse_projection_supported(self):
+        if not self._is_actor:
+            raise RuntimeError("Sparse projection can only be applied to actor workers.")
+        if self._is_lora:
+            raise NotImplementedError("Sparse projection currently supports full-parameter actor training, not LoRA.")
+        if fsdp_version(self.actor_module_fsdp) != 1:
+            raise NotImplementedError("Sparse projection currently supports the FSDP1 actor strategy only.")
+
+    _SPARSE_PROJECTION_ATTN_MATRICES = ("q_proj", "k_proj", "v_proj", "o_proj")
+    _SPARSE_PROJECTION_MLP_MATRICES = ("gate_proj", "up_proj", "down_proj")
+    _SPARSE_PROJECTION_DEFAULT_MATRICES = _SPARSE_PROJECTION_ATTN_MATRICES + _SPARSE_PROJECTION_MLP_MATRICES
+    _HSE_MONITOR_ALL_PARAMS_ALIASES = {"all_params", "all-params", "full_params", "full-params", "params"}
+
+    @classmethod
+    def _normalize_sparse_projection_targets(cls, target_matrices=None):
+        if target_matrices is None:
+            return set(cls._SPARSE_PROJECTION_DEFAULT_MATRICES)
+
+        if isinstance(target_matrices, str):
+            raw_targets = [part.strip() for part in target_matrices.split(",")]
+        else:
+            raw_targets = [str(part).strip() for part in target_matrices]
+
+        aliases = {
+            "all": cls._SPARSE_PROJECTION_DEFAULT_MATRICES,
+            "default": cls._SPARSE_PROJECTION_DEFAULT_MATRICES,
+            "attn": cls._SPARSE_PROJECTION_ATTN_MATRICES,
+            "self_attn": cls._SPARSE_PROJECTION_ATTN_MATRICES,
+            "mlp": cls._SPARSE_PROJECTION_MLP_MATRICES,
+            "q": ("q_proj",),
+            "k": ("k_proj",),
+            "v": ("v_proj",),
+            "o": ("o_proj",),
+            "gate": ("gate_proj",),
+            "up": ("up_proj",),
+            "down": ("down_proj",),
+        }
+        valid_targets = set(cls._SPARSE_PROJECTION_DEFAULT_MATRICES)
+        targets = []
+        for target in raw_targets:
+            if not target:
+                continue
+            key = target.lower()
+            if key in aliases:
+                targets.extend(aliases[key])
+            elif key in valid_targets:
+                targets.append(key)
+            else:
+                raise ValueError(
+                    f"Unknown sparse_projection target matrix: {target}. "
+                    f"Valid values: {', '.join(cls._SPARSE_PROJECTION_DEFAULT_MATRICES)}, attn, mlp, all."
+                )
+
+        if not targets:
+            raise ValueError("No sparse_projection target matrices selected.")
+        return set(targets)
+
+    @classmethod
+    def _is_sparse_projection_target(cls, param_name, target_matrices):
+        parts = param_name.split(".")
+        if len(parts) < 6 or parts[-1] != "weight" or parts[-5] != "layers":
+            return False
+
+        block_name = parts[-3]
+        matrix_name = parts[-2]
+        if matrix_name not in target_matrices:
+            return False
+        if matrix_name in cls._SPARSE_PROJECTION_ATTN_MATRICES:
+            return block_name == "self_attn"
+        if matrix_name in cls._SPARSE_PROJECTION_MLP_MATRICES:
+            return block_name == "mlp"
+        return False
+
+    def _check_hse_monitor_supported(self):
+        if not self._is_actor:
+            raise RuntimeError("HSE monitor can only be computed on actor workers.")
+        if fsdp_version(self.actor_module_fsdp) != 1:
+            raise NotImplementedError("HSE monitor currently supports the FSDP1 actor strategy only.")
+
+    @classmethod
+    def _normalize_hse_monitor_targets(cls, target_matrices=None):
+        if isinstance(target_matrices, str):
+            raw_targets = [part.strip() for part in target_matrices.split(",") if part.strip()]
+        elif target_matrices is None:
+            raw_targets = []
+        else:
+            raw_targets = [str(part).strip() for part in target_matrices if str(part).strip()]
+
+        include_all_params = False
+        matrix_targets = []
+        for target in raw_targets:
+            if target.lower() in cls._HSE_MONITOR_ALL_PARAMS_ALIASES:
+                include_all_params = True
+            else:
+                matrix_targets.append(target)
+
+        if matrix_targets:
+            target_matrices = cls._normalize_sparse_projection_targets(matrix_targets)
+        elif include_all_params:
+            target_matrices = set()
+        else:
+            target_matrices = cls._normalize_sparse_projection_targets("all")
+
+        return target_matrices, include_all_params
+
+    @classmethod
+    def _hse_monitor_matrix_name(cls, param_name):
+        parts = [part for part in param_name.split(".") if part != "_fsdp_wrapped_module"]
+        if len(parts) < 6 or parts[-1] != "weight" or parts[-5] != "layers":
+            return None
+
+        block_name = parts[-3]
+        matrix_name = parts[-2]
+        if matrix_name in cls._SPARSE_PROJECTION_ATTN_MATRICES and block_name == "self_attn":
+            return matrix_name
+        if matrix_name in cls._SPARSE_PROJECTION_MLP_MATRICES and block_name == "mlp":
+            return matrix_name
+        return None
+
+    @classmethod
+    def _hse_monitor_groups_for_param(cls, matrix_name, target_matrices, include_all_params):
+        groups = []
+        if include_all_params:
+            groups.append("all_params")
+        if matrix_name is None or matrix_name not in target_matrices:
+            return groups
+
+        groups.extend(("all", matrix_name))
+        if matrix_name in cls._SPARSE_PROJECTION_ATTN_MATRICES:
+            groups.append("attn")
+        elif matrix_name in cls._SPARSE_PROJECTION_MLP_MATRICES:
+            groups.append("mlp")
+        return groups
+
+    @staticmethod
+    def _add_hse_monitor_group_value(groups, group_name, hse, num_rows, numel):
+        group = groups.setdefault(group_name, {"hse_values": [], "row_counts": [], "numel": 0})
+        group["hse_values"].append(float(hse))
+        group["row_counts"].append(int(num_rows))
+        group["numel"] += int(numel)
+
+    @staticmethod
+    def _finalize_hse_monitor_group_metrics(group_name, group):
+        hse_values = group["hse_values"]
+        row_counts = group["row_counts"]
+        prefix = f"hse_monitor/{group_name}"
+        if hse_values:
+            hse_tensor = torch.tensor(hse_values, dtype=torch.float64)
+            row_tensor = torch.tensor(row_counts, dtype=torch.float64)
+            return {
+                f"{prefix}/hse_mean": hse_tensor.mean().item(),
+                f"{prefix}/hse_sum": hse_tensor.sum().item(),
+                f"{prefix}/hse_max": hse_tensor.max().item(),
+                f"{prefix}/hse_min": hse_tensor.min().item(),
+                f"{prefix}/num_matrices": len(hse_values),
+                f"{prefix}/numel": group["numel"],
+                f"{prefix}/rows_mean": row_tensor.mean().item(),
+                f"{prefix}/rows_max": row_tensor.max().item(),
+                f"{prefix}/rows_min": row_tensor.min().item(),
+            }
+        return {
+            f"{prefix}/hse_mean": 0.0,
+            f"{prefix}/hse_sum": 0.0,
+            f"{prefix}/hse_max": 0.0,
+            f"{prefix}/hse_min": 0.0,
+            f"{prefix}/num_matrices": 0,
+            f"{prefix}/numel": 0,
+            f"{prefix}/rows_mean": 0.0,
+            f"{prefix}/rows_max": 0.0,
+            f"{prefix}/rows_min": 0.0,
+        }
+
+    @staticmethod
+    def _compute_riesz_hse(matrix, s=1.0, eps=1e-6, chunk_size=0):
+        matrix = matrix.reshape(matrix.shape[0], -1).to(dtype=torch.float32)
+        num_rows = matrix.size(0)
+        if num_rows < 2:
+            return None
+
+        norm_matrix = matrix / (matrix.norm(dim=1, keepdim=True) + eps)
+        if chunk_size <= 0:
+            sim = torch.matmul(norm_matrix, norm_matrix.T).clamp(min=-1.0, max=1.0)
+            dist_matrix = torch.sqrt((2 - 2 * sim).clamp(min=eps))
+            energy = dist_matrix.pow(-s)
+            mask = ~torch.eye(num_rows, dtype=torch.bool, device=matrix.device)
+            return energy[mask].sum().item()
+
+        total = 0.0
+        for start in range(0, num_rows, chunk_size):
+            end = min(start + chunk_size, num_rows)
+            sim = torch.matmul(norm_matrix[start:end], norm_matrix.T).clamp(min=-1.0, max=1.0)
+            dist_matrix = torch.sqrt((2 - 2 * sim).clamp(min=eps))
+            energy = dist_matrix.pow(-s)
+            row_idx = torch.arange(end - start, device=matrix.device)
+            col_idx = torch.arange(start, end, device=matrix.device)
+            energy[row_idx, col_idx] = 0
+            total += energy.sum().item()
+        return total
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def compute_hse_monitor_metrics(
+        self,
+        target_matrices=None,
+        s=1.0,
+        chunk_size=0,
+        eps=1e-6,
+    ):
+        self._check_hse_monitor_supported()
+        target_matrices, include_all_params = self._normalize_hse_monitor_targets(target_matrices)
+        s = float(s)
+        chunk_size = int(chunk_size)
+        eps = float(eps)
+        if chunk_size < 0:
+            raise ValueError(f"hse_monitor chunk_size must be >= 0, got {chunk_size}")
+        if s <= 0:
+            raise ValueError(f"hse_monitor s must be positive, got {s}")
+        if eps <= 0:
+            raise ValueError(f"hse_monitor eps must be positive, got {eps}")
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        metrics = {}
+        try:
+            with torch.no_grad(), FSDP.summon_full_params(
+                self.actor_module_fsdp, writeback=False, rank0_only=True
+            ):
+                if dist.get_rank() == 0:
+                    actor_module = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+                    group_values = {}
+                    for name, param in actor_module.named_parameters():
+                        if not param.is_floating_point() or param.ndim < 2:
+                            continue
+                        matrix_name = self._hse_monitor_matrix_name(name)
+                        group_names = self._hse_monitor_groups_for_param(
+                            matrix_name=matrix_name,
+                            target_matrices=target_matrices,
+                            include_all_params=include_all_params,
+                        )
+                        if not group_names:
+                            continue
+
+                        matrix = param.detach()
+                        hse = self._compute_riesz_hse(matrix, s=s, eps=eps, chunk_size=chunk_size)
+                        if hse is None:
+                            continue
+
+                        for group_name in group_names:
+                            self._add_hse_monitor_group_value(
+                                groups=group_values,
+                                group_name=group_name,
+                                hse=hse,
+                                num_rows=matrix.shape[0],
+                                numel=matrix.numel(),
+                            )
+
+                    metrics.update(
+                        {
+                            "hse_monitor/enabled": 1,
+                            "hse_monitor/s": s,
+                            "hse_monitor/chunk_size": chunk_size,
+                            "hse_monitor/target_all_params": 1 if include_all_params else 0,
+                        }
+                    )
+                    for group_name, group in group_values.items():
+                        metrics.update(self._finalize_hse_monitor_group_metrics(group_name, group))
+        finally:
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            aggressive_empty_cache(force_sync=True)
+
+        dist.barrier()
+        return metrics
+
+    def _init_sparse_projection_anchor_impl(self, target_matrices=None):
+        self._check_sparse_projection_supported()
+        target_matrices = self._normalize_sparse_projection_targets(target_matrices)
+
+        if self._sparse_projection_anchor is not None:
+            return {
+                "sparse_projection/anchor_initialized": 1,
+                "sparse_projection/anchor_num_params": len(self._sparse_projection_anchor),
+                "sparse_projection/anchor_numel": sum(t.numel() for t in self._sparse_projection_anchor.values()),
+                "sparse_projection/target_num_matrices": len(target_matrices),
+            }
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        anchor = {}
+        try:
+            with FSDP.summon_full_params(self.actor_module_fsdp, writeback=False, rank0_only=False):
+                actor_module = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+                for name, param in actor_module.named_parameters():
+                    if not param.is_floating_point():
+                        continue
+                    if not self._is_sparse_projection_target(name, target_matrices):
+                        continue
+                    anchor[name] = param.detach().to(device="cpu", dtype=torch.float32).clone()
+        finally:
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            aggressive_empty_cache(force_sync=True)
+
+        self._sparse_projection_anchor = anchor
+        dist.barrier()
+        return {
+            "sparse_projection/anchor_initialized": 1,
+            "sparse_projection/anchor_num_params": len(anchor),
+            "sparse_projection/anchor_numel": sum(t.numel() for t in anchor.values()),
+            "sparse_projection/target_num_matrices": len(target_matrices),
+        }
+
+    @staticmethod
+    def _project_delta_into_soft_dirs(anchor_2d, delta_2d, energy_ratio, alpha):
+        if anchor_2d.numel() == 0 or delta_2d.numel() == 0:
+            return delta_2d, 0
+
+        anchor_hat = anchor_2d / (anchor_2d.norm(dim=1, keepdim=True) + 1e-8)
+        num_rows, num_cols = anchor_hat.shape
+        if num_rows >= num_cols:
+            covariance = (anchor_hat.T @ anchor_hat) / num_rows
+            eigvals, eigvecs = torch.linalg.eigh(covariance)
+            right_eigvecs = eigvecs
+        else:
+            gram = (anchor_hat @ anchor_hat.T) / num_rows
+            eigvals, left_eigvecs = torch.linalg.eigh(gram)
+            denom = torch.sqrt(eigvals.clamp_min(1e-12) * num_rows)
+            right_eigvecs = anchor_hat.T @ (left_eigvecs / denom.unsqueeze(0))
+        eigvals = eigvals.clamp_min(0)
+        total = eigvals.sum()
+        if total <= 0 or not torch.isfinite(total):
+            return delta_2d, 0
+
+        cumsum = torch.cumsum(eigvals.flip(0), 0)
+        rank = int((cumsum / total <= energy_ratio).sum().item()) + 1
+        rank = min(rank, right_eigvecs.size(1))
+        directions = right_eigvecs[:, -rank:]
+        projected_delta = delta_2d - alpha * (delta_2d @ directions) @ directions.T
+        return projected_delta, rank
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_sparse_projection_anchor(self, target_matrices=None):
+        return self._init_sparse_projection_anchor_impl(target_matrices=target_matrices)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def apply_sparse_projection(
+        self,
+        energy_ratio=0.5,
+        alpha=0.5,
+        max_projection_dim=0,
+        reset_optimizer_state=False,
+        target_matrices=None,
+    ):
+        self._check_sparse_projection_supported()
+        energy_ratio = float(energy_ratio)
+        alpha = float(alpha)
+        max_projection_dim = int(max_projection_dim)
+        target_matrices = self._normalize_sparse_projection_targets(target_matrices)
+
+        if not 0 <= energy_ratio <= 1:
+            raise ValueError(f"energy_ratio must be in [0, 1], got {energy_ratio}")
+        if not 0 <= alpha <= 1:
+            raise ValueError(f"alpha must be in [0, 1], got {alpha}")
+        if max_projection_dim < 0:
+            raise ValueError(f"max_projection_dim must be >= 0, got {max_projection_dim}")
+
+        if self._sparse_projection_anchor is None:
+            self._init_sparse_projection_anchor_impl(target_matrices=target_matrices)
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        metrics = {
+            "sparse_projection/applied": 1,
+            "sparse_projection/projected_params": 0,
+            "sparse_projection/skipped_low_dim_params": 0,
+            "sparse_projection/skipped_max_dim_params": 0,
+            "sparse_projection/skipped_untargeted_params": 0,
+            "sparse_projection/skipped_untargeted_numel": 0,
+            "sparse_projection/projected_numel": 0,
+            "sparse_projection/skipped_numel": 0,
+            "sparse_projection/selected_rank_mean": 0.0,
+            "sparse_projection/delta_norm": 0.0,
+            "sparse_projection/projected_delta_norm": 0.0,
+            "sparse_projection/reset_optimizer_state": 0,
+            "sparse_projection/target_num_matrices": len(target_matrices),
+        }
+        rank_sum = 0
+        delta_norm_sq = 0.0
+        projected_delta_norm_sq = 0.0
+
+        try:
+            with torch.no_grad(), FSDP.summon_full_params(
+                self.actor_module_fsdp, writeback=True, rank0_only=False
+            ):
+                actor_module = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+                for name, param in actor_module.named_parameters():
+                    if not param.is_floating_point():
+                        continue
+                    if not self._is_sparse_projection_target(name, target_matrices):
+                        metrics["sparse_projection/skipped_untargeted_params"] += 1
+                        metrics["sparse_projection/skipped_untargeted_numel"] += param.numel()
+                        continue
+
+                    current = param.detach().to(device="cpu", dtype=torch.float32)
+                    anchor = self._sparse_projection_anchor.get(name)
+                    if anchor is None:
+                        self._sparse_projection_anchor[name] = current.clone()
+                        metrics["sparse_projection/skipped_numel"] += current.numel()
+                        continue
+                    if tuple(anchor.shape) != tuple(current.shape):
+                        raise RuntimeError(
+                            f"Sparse projection anchor shape mismatch for {name}: "
+                            f"anchor={tuple(anchor.shape)}, current={tuple(current.shape)}"
+                        )
+
+                    delta = current - anchor
+                    delta_norm_sq += torch.linalg.vector_norm(delta).item() ** 2
+
+                    if current.ndim < 2:
+                        self._sparse_projection_anchor[name] = current.clone()
+                        metrics["sparse_projection/skipped_low_dim_params"] += 1
+                        metrics["sparse_projection/skipped_numel"] += current.numel()
+                        continue
+
+                    anchor_2d = anchor.reshape(anchor.shape[0], -1)
+                    delta_2d = delta.reshape(delta.shape[0], -1)
+                    projection_dim = anchor_2d.shape[1]
+                    if max_projection_dim > 0 and projection_dim > max_projection_dim:
+                        self._sparse_projection_anchor[name] = current.clone()
+                        metrics["sparse_projection/skipped_max_dim_params"] += 1
+                        metrics["sparse_projection/skipped_numel"] += current.numel()
+                        continue
+
+                    projected_delta_2d, selected_rank = self._project_delta_into_soft_dirs(
+                        anchor_2d=anchor_2d,
+                        delta_2d=delta_2d,
+                        energy_ratio=energy_ratio,
+                        alpha=alpha,
+                    )
+                    projected_delta = projected_delta_2d.reshape_as(current)
+                    projected = anchor + projected_delta
+                    param.copy_(projected.to(device=param.device, dtype=param.dtype))
+                    self._sparse_projection_anchor[name] = projected.clone()
+
+                    metrics["sparse_projection/projected_params"] += 1
+                    metrics["sparse_projection/projected_numel"] += current.numel()
+                    rank_sum += selected_rank
+                    projected_delta_norm_sq += torch.linalg.vector_norm(projected_delta).item() ** 2
+        finally:
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            aggressive_empty_cache(force_sync=True)
+
+        projected_params = metrics["sparse_projection/projected_params"]
+        if projected_params > 0:
+            metrics["sparse_projection/selected_rank_mean"] = rank_sum / projected_params
+        metrics["sparse_projection/delta_norm"] = delta_norm_sq**0.5
+        metrics["sparse_projection/projected_delta_norm"] = projected_delta_norm_sq**0.5
+
+        if reset_optimizer_state and self.actor_optimizer is not None:
+            self.actor_optimizer.state.clear()
+            metrics["sparse_projection/reset_optimizer_state"] = 1
+
+        dist.barrier()
+        return metrics
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")

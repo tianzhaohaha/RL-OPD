@@ -82,6 +82,181 @@ class DataParallelPPOActor(BasePPOActor):
             else entropy_from_logits
         )
         self.device_name = get_device_name()
+        self._row_direction_regularizer_hooks = []
+        self._row_direction_regularizer_loss = None
+        self._row_direction_regularizer_count = 0
+        self._row_direction_regularizer_collecting = False
+        self._register_row_direction_regularizer_hooks()
+
+    @staticmethod
+    def _as_bool(value):
+        if isinstance(value, str):
+            return value.lower() in {"1", "true", "yes", "y", "on"}
+        return bool(value)
+
+    _ROW_DIRECTION_ATTN_MATRICES = ("q_proj", "k_proj", "v_proj", "o_proj")
+    _ROW_DIRECTION_MLP_MATRICES = ("gate_proj", "up_proj", "down_proj")
+    _ROW_DIRECTION_DEFAULT_MATRICES = _ROW_DIRECTION_ATTN_MATRICES + _ROW_DIRECTION_MLP_MATRICES
+
+    def _row_direction_regularizer_config(self):
+        return self.config.get("row_direction_regularizer", {})
+
+    def _row_direction_regularizer_enabled(self):
+        regularizer_config = self._row_direction_regularizer_config()
+        return self._as_bool(regularizer_config.get("enable", False)) and float(regularizer_config.get("coef", 0.0)) != 0
+
+    @classmethod
+    def _normalize_row_direction_targets(cls, target_matrices=None):
+        if target_matrices is None:
+            return set(cls._ROW_DIRECTION_DEFAULT_MATRICES)
+
+        if isinstance(target_matrices, str):
+            raw_targets = [part.strip() for part in target_matrices.split(",")]
+        else:
+            raw_targets = [str(part).strip() for part in target_matrices]
+
+        aliases = {
+            "all": cls._ROW_DIRECTION_DEFAULT_MATRICES,
+            "default": cls._ROW_DIRECTION_DEFAULT_MATRICES,
+            "attn": cls._ROW_DIRECTION_ATTN_MATRICES,
+            "self_attn": cls._ROW_DIRECTION_ATTN_MATRICES,
+            "mlp": cls._ROW_DIRECTION_MLP_MATRICES,
+            "q": ("q_proj",),
+            "k": ("k_proj",),
+            "v": ("v_proj",),
+            "o": ("o_proj",),
+            "gate": ("gate_proj",),
+            "up": ("up_proj",),
+            "down": ("down_proj",),
+        }
+        valid_targets = set(cls._ROW_DIRECTION_DEFAULT_MATRICES)
+        targets = []
+        for target in raw_targets:
+            if not target:
+                continue
+            key = target.lower()
+            if key in aliases:
+                targets.extend(aliases[key])
+            elif key in valid_targets:
+                targets.append(key)
+            else:
+                raise ValueError(
+                    f"Unknown row_direction_regularizer target matrix: {target}. "
+                    f"Valid values: {', '.join(cls._ROW_DIRECTION_DEFAULT_MATRICES)}, attn, mlp, all."
+                )
+
+        if not targets:
+            raise ValueError("No row_direction_regularizer target matrices selected.")
+        return set(targets)
+
+    @classmethod
+    def _is_row_direction_target_module(cls, module_name, module, target_matrices):
+        weight = getattr(module, "weight", None)
+        if weight is None or weight.ndim < 2:
+            return False
+
+        parts = [part for part in module_name.split(".") if part != "_fsdp_wrapped_module"]
+        for idx, part in enumerate(parts):
+            if part != "layers" or idx + 3 >= len(parts):
+                continue
+            if not parts[idx + 1].isdigit():
+                continue
+            block_name = parts[idx + 2]
+            matrix_name = parts[idx + 3]
+            if idx + 4 != len(parts) or matrix_name not in target_matrices:
+                continue
+            if matrix_name in cls._ROW_DIRECTION_ATTN_MATRICES:
+                return block_name == "self_attn"
+            if matrix_name in cls._ROW_DIRECTION_MLP_MATRICES:
+                return block_name == "mlp"
+        return False
+
+    def _register_row_direction_regularizer_hooks(self):
+        if self.actor_optimizer is None or not self._row_direction_regularizer_enabled():
+            return
+
+        regularizer_config = self._row_direction_regularizer_config()
+        target_matrices = self._normalize_row_direction_targets(regularizer_config.get("target_matrices", "all"))
+        for module_name, module in self.actor_module.named_modules():
+            if not self._is_row_direction_target_module(module_name, module, target_matrices):
+                continue
+            self._row_direction_regularizer_hooks.append(
+                module.register_forward_pre_hook(self._make_row_direction_regularizer_hook(module_name))
+            )
+
+        if not self._row_direction_regularizer_hooks:
+            raise ValueError(
+                "row_direction_regularizer is enabled, but no target q/k/v/o/gate/up/down modules were found."
+            )
+        if torch.distributed.get_rank() == 0:
+            print(
+                "Row-direction regularizer targets "
+                f"{len(self._row_direction_regularizer_hooks)} modules: {sorted(target_matrices)}"
+            )
+
+    def _make_row_direction_regularizer_hook(self, module_name):
+        def hook(module, _inputs):
+            if not self._row_direction_regularizer_collecting:
+                return
+            weight = getattr(module, "weight", None)
+            if weight is None or weight.ndim < 2 or not weight.requires_grad:
+                return
+            with torch.enable_grad(), torch.autocast(device_type=self.device_name, enabled=False):
+                torch._C._autograd._push_saved_tensors_default_hooks(lambda tensor: tensor, lambda tensor: tensor)
+                try:
+                    regularizer = self._compute_row_direction_regularizer(weight)
+                finally:
+                    torch._C._autograd._pop_saved_tensors_default_hooks()
+            if regularizer is None:
+                return
+            if self._row_direction_regularizer_loss is None:
+                self._row_direction_regularizer_loss = regularizer
+            else:
+                self._row_direction_regularizer_loss = self._row_direction_regularizer_loss + regularizer
+            self._row_direction_regularizer_count += 1
+
+        return hook
+
+    def _compute_row_direction_regularizer(self, weight):
+        regularizer_config = self._row_direction_regularizer_config()
+        eps = float(regularizer_config.get("eps", 1e-6))
+        row_sample_size = int(regularizer_config.get("row_sample_size", 256))
+        mode = str(regularizer_config.get("mode", "orthogonal")).lower()
+
+        matrix = weight.reshape(weight.shape[0], -1).to(dtype=torch.float32)
+        num_rows = matrix.size(0)
+        if num_rows < 2:
+            return None
+        if row_sample_size > 0 and num_rows > row_sample_size:
+            row_idx = torch.linspace(0, num_rows - 1, steps=row_sample_size, device=matrix.device).round().long()
+            matrix = matrix.index_select(0, row_idx)
+
+        norm_matrix = matrix / (matrix.norm(dim=1, keepdim=True) + eps)
+        sim = torch.matmul(norm_matrix, norm_matrix.T).clamp(min=-1.0, max=1.0)
+        off_diag_mask = ~torch.eye(sim.size(0), dtype=torch.bool, device=sim.device)
+        if off_diag_mask.sum() == 0:
+            return None
+
+        if mode in {"orthogonal", "ortho"}:
+            return sim[off_diag_mask].pow(2).mean()
+        if mode in {"hse", "riesz"}:
+            s = float(regularizer_config.get("s", 1.0))
+            dist = torch.sqrt((2 - 2 * sim).clamp(min=eps))
+            return dist[off_diag_mask].pow(-s).mean()
+        raise ValueError("row_direction_regularizer.mode must be 'orthogonal' or 'hse'.")
+
+    def _begin_row_direction_regularizer_collection(self):
+        if not self._row_direction_regularizer_enabled():
+            return
+        self._row_direction_regularizer_loss = None
+        self._row_direction_regularizer_count = 0
+        self._row_direction_regularizer_collecting = True
+
+    def _end_row_direction_regularizer_collection(self):
+        self._row_direction_regularizer_collecting = False
+        if self._row_direction_regularizer_loss is None or self._row_direction_regularizer_count == 0:
+            return None, 0
+        return self._row_direction_regularizer_loss / self._row_direction_regularizer_count, self._row_direction_regularizer_count
 
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False, top_k=0, student_top_k_ids=None
@@ -825,26 +1000,30 @@ class DataParallelPPOActor(BasePPOActor):
                     
                     # Check if we have 3D advantages (top-k sampling case)
                     # If so, we need to recompute top-k log probs for correct gradient
-                    if advantages.dim() == 3:
-                        top_k = advantages.shape[-1]
-                        # For union strategy, use union_top_k_ids; otherwise use student_top_k_ids
-                        student_top_k_ids = None
-                        if "union_top_k_ids" in model_inputs:
-                            student_top_k_ids = model_inputs["union_top_k_ids"]
-                        elif "student_top_k_ids" in model_inputs:
-                            student_top_k_ids = model_inputs["student_top_k_ids"]
+                    self._begin_row_direction_regularizer_collection()
+                    try:
+                        if advantages.dim() == 3:
+                            top_k = advantages.shape[-1]
+                            # For union strategy, use union_top_k_ids; otherwise use student_top_k_ids
+                            student_top_k_ids = None
+                            if "union_top_k_ids" in model_inputs:
+                                student_top_k_ids = model_inputs["union_top_k_ids"]
+                            elif "student_top_k_ids" in model_inputs:
+                                student_top_k_ids = model_inputs["student_top_k_ids"]
 
-                        entropy, _, _, topk_log_probs = self._forward_micro_batch(
-                            model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
-                            top_k=top_k, student_top_k_ids=student_top_k_ids
-                        )
-                        log_prob_for_loss = topk_log_probs
-                        
-                    else:
-                        _, log_prob, *_ = self._forward_micro_batch(
-                            model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
-                        )
-                        log_prob_for_loss = log_prob
+                            entropy, _, _, topk_log_probs = self._forward_micro_batch(
+                                model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
+                                top_k=top_k, student_top_k_ids=student_top_k_ids
+                            )
+                            log_prob_for_loss = topk_log_probs
+
+                        else:
+                            _, log_prob, *_ = self._forward_micro_batch(
+                                model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                            )
+                            log_prob_for_loss = log_prob
+                    finally:
+                        row_direction_loss, row_direction_count = self._end_row_direction_regularizer_collection()
 
                     format_mask = None
                     if "format_mask" in model_inputs.keys():
@@ -922,6 +1101,26 @@ class DataParallelPPOActor(BasePPOActor):
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
+
+                    if row_direction_loss is not None:
+                        row_direction_coef = float(self._row_direction_regularizer_config().get("coef", 0.0))
+                        weighted_row_direction_loss = row_direction_loss * row_direction_coef
+                        policy_loss = policy_loss + weighted_row_direction_loss
+                        micro_batch_metrics["actor/row_direction_regularizer_loss"] = (
+                            weighted_row_direction_loss.detach().item() * loss_scale_factor
+                        )
+                        micro_batch_metrics["actor/row_direction_regularizer_raw_loss"] = (
+                            row_direction_loss.detach().item() * loss_scale_factor
+                        )
+                        micro_batch_metrics["actor/row_direction_regularizer_coef"] = row_direction_coef
+                    elif self._row_direction_regularizer_enabled():
+                        micro_batch_metrics["actor/row_direction_regularizer_loss"] = 0.0
+                        micro_batch_metrics["actor/row_direction_regularizer_raw_loss"] = 0.0
+                        micro_batch_metrics["actor/row_direction_regularizer_coef"] = float(
+                            self._row_direction_regularizer_config().get("coef", 0.0)
+                        )
+                    if self._row_direction_regularizer_enabled():
+                        micro_batch_metrics["actor/row_direction_regularizer_num_matrices"] = row_direction_count
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz

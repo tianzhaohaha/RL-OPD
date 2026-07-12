@@ -25,7 +25,13 @@ from .engine import FSDPEngineConfig, McoreEngineConfig
 from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
-__all__ = ["PolicyLossConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig"]
+__all__ = [
+    "PolicyLossConfig",
+    "RowDirectionRegularizerConfig",
+    "ActorConfig",
+    "FSDPActorConfig",
+    "McoreActorConfig",
+]
 
 
 @dataclass
@@ -49,6 +55,19 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+
+
+@dataclass
+class RowDirectionRegularizerConfig(BaseConfig):
+    """Configuration for row-direction actor weight regularization."""
+
+    enable: bool = False
+    coef: float = 0.0
+    mode: str = "orthogonal"
+    target_matrices: str = "all"
+    row_sample_size: int = 256
+    s: float = 1.0
+    eps: float = 1e-6
 
 
 @dataclass
@@ -103,6 +122,7 @@ class ActorConfig(BaseConfig):
     clip_ratio_high: float = 0.2
     freeze_vision_tower: bool = False
     policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
+    row_direction_regularizer: RowDirectionRegularizerConfig = field(default_factory=RowDirectionRegularizerConfig)
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
     entropy_coeff: float = 0

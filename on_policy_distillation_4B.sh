@@ -36,7 +36,7 @@ fi
 # ray stop --force
 export RAY_memory_usage_threshold=0.99
 export CUDA_LAUNCH_BLOCKING=1
-export CUDA_VISIBLE_DEVICES=2,3,4
+export CUDA_VISIBLE_DEVICES=5,6,7
 export PYTHONUNBUFFERED=1
 export PROJECT_NAME='OnPolicyDistillation' # TODO
 export TORCH_NCCL_BLOCKING_WAIT=1
@@ -83,9 +83,9 @@ export SPARSE_PROJECTION_RESET_OPTIMIZER=${SPARSE_PROJECTION_RESET_OPTIMIZER:-Fa
 
 export ENABLE_ROW_DIRECTION_REGULARIZER=${ENABLE_ROW_DIRECTION_REGULARIZER:-False} # True / False
 export ROW_DIRECTION_REGULARIZER_COEF=${ROW_DIRECTION_REGULARIZER_COEF:-1e-2}
-export ROW_DIRECTION_REGULARIZER_MODE=${ROW_DIRECTION_REGULARIZER_MODE:-"hse"} # orthogonal / hse
+export ROW_DIRECTION_REGULARIZER_MODE=${ROW_DIRECTION_REGULARIZER_MODE:-"orthogonal"} # orthogonal / hse
 export ROW_DIRECTION_REGULARIZER_TARGET_MATRICES=${ROW_DIRECTION_REGULARIZER_TARGET_MATRICES:-"all"} # all / attn / mlp / q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
-export ROW_DIRECTION_REGULARIZER_ROW_SAMPLE_SIZE=${ROW_DIRECTION_REGULARIZER_ROW_SAMPLE_SIZE:-256} # 0 means all rows
+export ROW_DIRECTION_REGULARIZER_ROW_SAMPLE_SIZE=${ROW_DIRECTION_REGULARIZER_ROW_SAMPLE_SIZE:-512} # 0 means all rows
 export ROW_DIRECTION_REGULARIZER_S=${ROW_DIRECTION_REGULARIZER_S:-1.0} # Riesz exponent when mode=hse
 export ROW_DIRECTION_REGULARIZER_EPS=${ROW_DIRECTION_REGULARIZER_EPS:-1e-5}
 
@@ -146,12 +146,12 @@ export ACTOR_MODEL_PATH=model/Qwen3-1.7B
 # export ACTOR_MODEL_PATH=model/DeepSeek-R1-Distill-Qwen-7B
 # export ACTOR_MODEL_PATH=model/DS-1.5B-SFT
 export ACTOR_MODEL_NAME=$(basename "$ACTOR_MODEL_PATH")
-export REWARD_MODEL_PATH=model/Qwen3-4B
+# export REWARD_MODEL_PATH=model/Qwen3-4B
 # export REWARD_MODEL_PATH=model/Qwen3-4B-grpo
 # export REWARD_MODEL_PATH=model/Qwen3-1.7B
 # export REWARD_MODEL_PATH=model/OpenMath-Nemotron-1.5B
 # export REWARD_MODEL_PATH=model/DeepSeek-R1-Distill-Qwen-7B
-# export REWARD_MODEL_PATH=model/Qwen3-4B-Non-Thinking-RL-Math
+export REWARD_MODEL_PATH=model/Qwen3-4B-Non-Thinking-RL-Math
 # export REWARD_MODEL_PATH=model/Skywork-OR1-Math-7B
 # export REWARD_MODEL_PATH=model/Polaris-4B-Preview
 # export REWARD_MODEL_PATH=model/DeepSeek-R1-Distill-Qwen-14B
@@ -202,7 +202,7 @@ PPO_MAX_TOKEN_LEN_PER_GPU=$(( ((1024 + MAX_RESP_LENGTH) > 32768) ? (1024 + MAX_R
 echo "PPO_MAX_TOKEN_LEN_PER_GPU: $PPO_MAX_TOKEN_LEN_PER_GPU"
 
 
-ray start --head --port=6333 --dashboard-port=8333 --temp-dir=/tmp/ray_b
+ray start --head --port=6444 --dashboard-port=8444 --temp-dir=/tmp/ray_d
 sleep 5
 
 
@@ -248,7 +248,7 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.rollout.reward_weight_mode=$REWARD_WEIGHT_MODE \
     +actor_rollout_ref.rollout.teacher_temperature=$TEACHER_TEMPERATURE \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$PARALLEL_SIZE \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.3 \
     actor_rollout_ref.rollout.max_model_len=$MAX_MODEL_LEN \
     actor_rollout_ref.rollout.n=$N_RESPONSES \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \

@@ -65,6 +65,33 @@ policy_loss:
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
 
+# Row-direction weight regularizer config
+row_direction_regularizer:
+
+  # # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.RowDirectionRegularizerConfig
+
+  # Whether to add row-direction regularization to actor loss
+  enable: false
+
+  # Regularizer coefficient added to actor loss
+  coef: 0.0
+
+  # Regularizer mode: orthogonal or hse
+  mode: orthogonal
+
+  # Target transformer matrices: all, attn, mlp, or comma-separated q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+  target_matrices: all
+
+  # Number of rows sampled per matrix; 0 means all rows
+  row_sample_size: 256
+
+  # Riesz exponent used when mode is hse
+  s: 1.0
+
+  # Numerical epsilon for row normalization and HSE distances
+  eps: 1.0e-6
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

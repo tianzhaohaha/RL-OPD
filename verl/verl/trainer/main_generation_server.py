@@ -1,3 +1,4 @@
+# pyright: reportMissingImports=false, reportMissingModuleSource=false
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -64,19 +65,33 @@ async def start_server(config):
 
 
 async def submit_request(server_address, **chat_complete_request):
-    try:
-        extra_headers = chat_complete_request.pop("extra_headers", {})
-        timeout = aiohttp.ClientTimeout(total=None)
-        session = aiohttp.ClientSession(timeout=timeout)
-        async with session.post(
-            url=f"http://{server_address}/v1/chat/completions",
-            headers={"Authorization": "Bearer token-abc123", **extra_headers},
-            json=chat_complete_request,
-        ) as resp:
-            data = await resp.json()
-            return ChatCompletion(**data)
-    finally:
-        await session.close()
+    extra_headers = chat_complete_request.pop("extra_headers", {})
+    timeout = aiohttp.ClientTimeout(total=None)
+    max_retries = int(os.environ.get("VERL_GENERATION_SERVER_RETRIES", "60"))
+    retry_delay = float(os.environ.get("VERL_GENERATION_SERVER_RETRY_DELAY", "1"))
+    last_error = None
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for attempt in range(1, max_retries + 1):
+            try:
+                async with session.post(
+                    url=f"http://{server_address}/v1/chat/completions",
+                    headers={"Authorization": "Bearer token-abc123", **extra_headers},
+                    json=chat_complete_request,
+                ) as resp:
+                    data = await resp.json()
+                    if resp.status >= 400:
+                        raise RuntimeError(f"vLLM server returned HTTP {resp.status}: {data}")
+                    return ChatCompletion(**data)
+            except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as exc:
+                last_error = exc
+                if attempt == max_retries:
+                    break
+                await asyncio.sleep(retry_delay)
+
+    raise RuntimeError(
+        f"Failed to submit request to vLLM server {server_address} after {max_retries} attempts"
+    ) from last_error
 
 
 async def generate_per_replica(server_address, model_path: str, n_samples: int, sampling_params: dict, chat_lst: list):
@@ -121,7 +136,15 @@ async def generate(
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
-    ray.init(runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_USE_V1": "1"}})
+    ray_env_vars = {
+        "TOKENIZERS_PARALLELISM": os.environ.get("TOKENIZERS_PARALLELISM", "true"),
+        "NCCL_DEBUG": os.environ.get("NCCL_DEBUG", "WARN"),
+        "VLLM_USE_V1": os.environ.get("VLLM_USE_V1", "1"),
+        "VLLM_USE_FLASHINFER_SAMPLER": os.environ.get("VLLM_USE_FLASHINFER_SAMPLER", "0"),
+        "VLLM_ATTENTION_BACKEND": os.environ.get("VLLM_ATTENTION_BACKEND", "FLASH_ATTN"),
+        "HYDRA_FULL_ERROR": os.environ.get("HYDRA_FULL_ERROR", "1"),
+    }
+    ray.init(runtime_env={"env_vars": ray_env_vars})
 
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
     OmegaConf.resolve(config)
